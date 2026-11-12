@@ -20,6 +20,7 @@
 #include <utility>
 #include <math.h>
 #include <fstream>
+#include <sstream>
 #include <x86intrin.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -28,6 +29,7 @@
 #include <random>
 #include <set>
 #include <sys/syscall.h>
+#include <errno.h>
 #include "solver.h"
 #include "sysinfo.h"
 
@@ -156,7 +158,7 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
 
 
 
-int setupMeasure(int cpuid, unsigned int channel,unsigned int rank, unsigned int bank, bool bankGroup=false)
+int setupMeasure(int cpuid, unsigned int channel,unsigned int rank, unsigned int bank, bool bankGroup=false, bool channelOnly=false)
 {
     struct perf_event_attr pe;
     int fd;
@@ -187,18 +189,20 @@ int setupMeasure(int cpuid, unsigned int channel,unsigned int rank, unsigned int
     bankBits = bankBits << 8;
     auto rankBits = 0xb0 + rank;
     auto bits = bankBits | rankBits;
-    pe.config = bits ; //umask first followed by event id
+    pe.config = channelOnly ? ((0x03 << 8) | 0x04) : bits;
     // exact config is in cat /sys/devices/cpu/format/event
     pe.disabled = 1;
     pe.sample_type=PERF_SAMPLE_IDENTIFIER;
     pe.inherit=0;
-    pe.exclude_guest=1;
+    // pe.exclude_guest=1; setting this optional field was throwing EINVAL
 
     //how to get per-socket numbers? choose the cpu id in syscall
     //pid = -1 cpu >= 0 -> global measurement
     fd = perf_event_open(&pe, -1, cpuid, -1, 0);
     if (fd == -1) {
-        std::cout << "Setup of performance counters failed" << std::endl;
+        std::cerr << "Setup of performance counters failed for " << imc
+                << " (config 0x" << std::hex << pe.config << std::dec
+                << "): " << strerror(errno) << std::endl;
         exit(EXIT_FAILURE);
     }
 
@@ -431,6 +435,27 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     srand(3344);
+    const auto imcs = SysInfo::getImcs();
+    const bool channelOnly = imcs.size() > 4;
+    if(channelOnly)
+    {
+        cout << "Using CAS read counters on " << imcs.size()
+             << " IMC channels; rank and bank mapping is unavailable on this PMU" << endl;
+        std::ifstream cpuMaskFile(imcs.front() + "/cpumask");
+        std::string cpuMask;
+        std::getline(cpuMaskFile, cpuMask);
+        std::istringstream cpus(cpuMask);
+        std::string cpu;
+        for(unsigned int i = 0; i <= nodeid; i++)
+        {
+            if(!std::getline(cpus, cpu, ','))
+            {
+                std::cerr << "Cannot find a PMU CPU for socket " << nodeid << std::endl;
+                return EXIT_FAILURE;
+            }
+        }
+        cpuid = std::stoul(cpu);
+    }
 
     std::set<uint64_t> usedAddresses;
     std::map<size_t,std::vector<uint64_t>>channelAddresses;
@@ -457,7 +482,24 @@ int main(int argc, char *argv[])
         int identifiedBank = -1;
         int identifiedBankGroup = -1;
         bool found = false;
-        for(unsigned int channel = 0; channel < 4 && !found; channel++)
+        if(channelOnly)
+        {
+            long long bestCount = -1;
+            for(size_t channel = 0; channel < imcs.size(); channel++)
+            {
+                auto fd = setupMeasure(cpuid,channel,0,0,false,true);
+                startMeasure(fd);
+                access(adr,numAccess);
+                auto count = stopMeasure(fd);
+                if(count > bestCount)
+                {
+                    bestCount = count;
+                    identifiedChannel = channel;
+                }
+            }
+            found = bestCount >= 0.9 * numAccess;
+        }
+        else for(unsigned int channel = 0; channel < 4 && !found; channel++)
         {
             for(unsigned int rank = 0; rank < 8 && !found; rank++)
             {
@@ -495,10 +537,18 @@ int main(int argc, char *argv[])
         if(found)
         {
             channelAddresses[identifiedChannel].push_back(physicalAddress);
-            rankAddresses[identifiedRank].push_back(physicalAddress);
-            bankAddresses[identifiedBank].push_back(physicalAddress);
-            bankGroupAddresses[identifiedBankGroup].push_back(physicalAddress);
-            if(verbose) cout << " Channel " << identifiedChannel << " Rank " << identifiedRank << " Bank " << identifiedBank << " BankGroup" << identifiedBankGroup << endl;
+            if(!channelOnly)
+            {
+                rankAddresses[identifiedRank].push_back(physicalAddress);
+                bankAddresses[identifiedBank].push_back(physicalAddress);
+                bankGroupAddresses[identifiedBankGroup].push_back(physicalAddress);
+            }
+            if(verbose)
+            {
+                cout << " Channel " << identifiedChannel;
+                if(!channelOnly) cout << " Rank " << identifiedRank << " Bank " << identifiedBank << " BankGroup " << identifiedBankGroup;
+                cout << endl;
+            }
         }
         else
         {
@@ -506,19 +556,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (size_t i = 0 ;i < 4; i++)
+    for (size_t i = 0 ;i < (channelOnly ? imcs.size() : 4); i++)
     {
         std::cout << "Caputured " << channelAddresses[i].size() << " addresses on channel " << i << endl;
     }
-    for (size_t j = 0 ;j < 8; j++)
+    if(!channelOnly) for (size_t j = 0 ;j < 8; j++)
     {
         std::cout << "Caputured " << rankAddresses[j].size() << " addresses on rank " << j << endl;
     }
-    for(size_t k = 0; k < 16; k++)
+    if(!channelOnly) for(size_t k = 0; k < 16; k++)
     {
         std::cout << "Caputured " << bankAddresses[k].size() << " addresses on bank " << k << endl;
     }
-    for(size_t k = 0; k < 4; k++)
+    if(!channelOnly) for(size_t k = 0; k < 4; k++)
     {
         std::cout << "Caputured " << bankGroupAddresses[k].size() << " addresses on bankGroup " << k << endl;
     }
@@ -570,6 +620,12 @@ int main(int argc, char *argv[])
     }
     if(verbose) std::cout << "Remove " << removeBack << " from back" << endl;
     if(verbose) cout << endl;
+
+    if(channelOnly)
+    {
+        cout << "Use -v for per-address channel assignments. The XOR solver does not model six-way channel selection." << endl;
+        return 0;
+    }
 
 
     if(considerTadRegions)
